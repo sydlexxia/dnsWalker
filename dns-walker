@@ -1,0 +1,222 @@
+#!/bin/sh
+# dns-walker — self-installing, cross-platform DNS walker
+#
+# Usage: dns-walker [options] <domain>
+#   -h / --help    Show help
+#   -q / --quiet   Only print issues
+#   -d / --debug   Show each DNS query step with timing
+#
+# First run: installs a Python venv with dnspython (internet needed, ~5 s).
+# Subsequent runs execute instantly from the cached venv.
+#
+# Install locations (tried in order):
+#   /usr/local/share/dns-walker   (system-wide, if writable)
+#   ~/.local/share/dns-walker     (user-local, fallback)
+#
+# Requires: Python 3.8+  (brew / apt / dnf install python3)
+#           Internet access on the very first run
+
+set -e
+
+_PROG="dns-walker"
+_VERSION="1.0.0"
+_READY_TAG=".ready-${_VERSION}"
+
+# ── embedded Python source ─────────────────────────────────────────────────────
+# Output the Python script to stdout; caller redirects to a file.
+_py_source() {
+cat << 'PYEOF'
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.8"
+# dependencies = [
+#   "dnspython>=2.0",
+# ]
+# ///
+"""
+DNS Walker – minimalist command-line DNS walker / checker
+
+Usage:
+  dns-walker [options] <domain>
+
+Options:
+  -h / --help    Show this help and exit
+  -q / --quiet   Only print detected issues (suppress full record dump)
+  -d / --debug   Show each DNS query step with resolver info and timing
+
+Exit status: 0 = all checks passed, 1 = potential issues detected.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from typing import Dict, List
+
+import dns.exception
+import dns.resolver
+
+RECORD_TYPES = ("A", "AAAA", "CNAME", "MX", "NS", "SOA", "TXT")
+
+
+def _query(domain: str, rtype: str, debug: bool = False) -> List[str]:
+    if debug:
+        print(f"  [debug] querying {rtype} for {domain} …", file=sys.stderr, flush=True)
+    t0 = time.monotonic()
+    try:
+        answers = dns.resolver.resolve(domain, rtype, lifetime=5)
+        result = [a.to_text() for a in answers]
+    except dns.resolver.NXDOMAIN:
+        result = ["NXDOMAIN"]
+    except dns.resolver.NoAnswer:
+        result = []
+    except dns.exception.Timeout:
+        result = ["TIMEOUT"]
+    except Exception as exc:
+        result = [f"ERROR:{type(exc).__name__}:{exc}"]
+    if debug:
+        elapsed = time.monotonic() - t0
+        label = ", ".join(result) if result else "<no records>"
+        print(f"  [debug]   → {label} ({elapsed:.3f}s)", file=sys.stderr, flush=True)
+    return result
+
+
+def collect_records(domain: str, debug: bool = False) -> Dict[str, List[str]]:
+    if debug:
+        resolver = dns.resolver.get_default_resolver()
+        ns_list = [str(ns) for ns in getattr(resolver, "nameservers", [])]
+        print(f"[debug] resolver(s): {', '.join(ns_list) or 'system default'}", file=sys.stderr)
+        print(f"[debug] querying {len(RECORD_TYPES)} record types: {', '.join(RECORD_TYPES)}", file=sys.stderr)
+    return {rt: _query(domain, rt, debug=debug) for rt in RECORD_TYPES}
+
+
+def _real_records(values: List[str]) -> List[str]:
+    return [v for v in values if not v.startswith(("NXDOMAIN", "TIMEOUT", "ERROR:"))]
+
+
+def analyse(records: Dict[str, List[str]]) -> List[str]:
+    issues: List[str] = []
+    if not _real_records(records.get("A", [])) and not _real_records(records.get("AAAA", [])):
+        issues.append("No A or AAAA records – site may be unreachable over HTTP/HTTPS.")
+    if len(_real_records(records.get("NS", []))) < 2:
+        issues.append("Fewer than two NS records – poor fault tolerance.")
+    if not _real_records(records.get("SOA", [])):
+        issues.append("SOA record missing – zone may be malformed.")
+    return issues
+
+
+def main(argv: List[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        prog="dns-walker",
+        description="Walk DNS records and detect common issues.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Exit status: 0 = all checks passed, 1 = potential issues detected.",
+    )
+    parser.add_argument("domain", help="Domain name to inspect (e.g. example.com)")
+    parser.add_argument("-q", "--quiet", action="store_true", help="Only output detected issues")
+    parser.add_argument("-d", "--debug", action="store_true",
+                        help="Show each DNS query step with resolver info and timing")
+    args = parser.parse_args(argv)
+
+    domain = args.domain.strip().rstrip(".")
+    if not domain or " " in domain or len(domain) > 253:
+        parser.error(f"Invalid domain name: {args.domain!r}")
+
+    if args.debug:
+        print(f"[debug] starting DNS walk for: {domain}", file=sys.stderr)
+
+    records = collect_records(domain, debug=args.debug)
+    problems = analyse(records)
+
+    if args.debug:
+        print(f"[debug] analysis complete — {len(problems)} issue(s) found", file=sys.stderr)
+
+    if not args.quiet:
+        print(f"\nDNS records for {domain}:")
+        for rtype, answers in records.items():
+            human = ", ".join(answers) if answers else "<none>"
+            print(f"  {rtype:5}: {human}")
+        print()
+
+    if problems:
+        print("Potential issues detected:")
+        for p in problems:
+            print(f" • {p}")
+        sys.exit(1)
+    else:
+        print("No obvious issues detected – all basic checks passed.")
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+}
+
+# ── locate / create the install directory ─────────────────────────────────────
+_SYS_BASE="/usr/local/share/dns-walker"
+_USER_BASE="${HOME}/.local/share/dns-walker"
+
+if mkdir -p "${_SYS_BASE}" 2>/dev/null; then
+    _BASE="${_SYS_BASE}"
+elif [ -d "${_SYS_BASE}" ] && [ -f "${_SYS_BASE}/${_READY_TAG}" ]; then
+    # System-wide install exists (e.g. set up by root) — use it read-only
+    _BASE="${_SYS_BASE}"
+else
+    mkdir -p "${_USER_BASE}"
+    _BASE="${_USER_BASE}"
+fi
+
+_VENV="${_BASE}/venv"
+_SCRIPT="${_BASE}/dns_walker.py"
+
+# ── write / refresh the embedded Python source ────────────────────────────────
+if [ -w "${_BASE}" ]; then
+    _py_source > "${_SCRIPT}"
+elif [ ! -f "${_SCRIPT}" ]; then
+    # No write access and no cached copy — use a session-scoped temp file
+    _SCRIPT="/tmp/dns_walker_$$.py"
+    _py_source > "${_SCRIPT}"
+    # shellcheck disable=SC2064
+    trap "rm -f '${_SCRIPT}'" EXIT INT TERM
+fi
+
+# ── first-run setup: find Python 3, create venv, install dnspython ────────────
+if [ ! -f "${_BASE}/${_READY_TAG}" ]; then
+
+    _SYS_PY=""
+    for _cand in python3 python3.12 python3.11 python3.10 python3.9 python3.8; do
+        if command -v "${_cand}" >/dev/null 2>&1; then
+            _maj=$("${_cand}" -c 'import sys; print(sys.version_info.major)' 2>/dev/null) || continue
+            [ "${_maj}" = "3" ] && _SYS_PY="${_cand}" && break
+        fi
+    done
+
+    if [ -z "${_SYS_PY}" ]; then
+        printf '%s: Python 3 is required but was not found.\n' "${_PROG}" >&2
+        printf '  macOS:          brew install python3\n' >&2
+        printf '  Debian/Ubuntu:  sudo apt install python3 python3-venv\n' >&2
+        printf '  RHEL/Fedora:    sudo dnf install python3\n' >&2
+        exit 1
+    fi
+
+    _PY_VER=$("${_SYS_PY}" -c 'import sys; print(sys.version.split()[0])')
+    printf '%s: first-run setup (Python %s) — creating venv and installing dnspython...\n' \
+        "${_PROG}" "${_PY_VER}" >&2
+
+    if ! "${_SYS_PY}" -m venv "${_VENV}" 2>/dev/null; then
+        printf '%s: venv creation failed.\n' "${_PROG}" >&2
+        printf '  Debian/Ubuntu:  sudo apt install python3-venv python3-full\n' >&2
+        printf '  RHEL/Fedora:    sudo dnf install python3\n' >&2
+        exit 1
+    fi
+
+    "${_VENV}/bin/pip" install --quiet --disable-pip-version-check dnspython
+
+    touch "${_BASE}/${_READY_TAG}"
+    printf '%s: setup complete.\n\n' "${_PROG}" >&2
+fi
+
+# ── run ───────────────────────────────────────────────────────────────────────
+exec "${_VENV}/bin/python" "${_SCRIPT}" "$@"
